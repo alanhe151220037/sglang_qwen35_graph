@@ -21,7 +21,12 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    get_pcg_capture_stream,
+    is_in_pcg_torch_compile,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -119,6 +124,17 @@ def unified_linear_attention_with_output(
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
+    if _try_unified_linear_attention_inner_cuda_graph(
+        forward_batch=forward_batch,
+        attention_layer=attention_layer,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        real_num_tokens=real_num_tokens,
+    ):
+        return
+
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
     token_to_kv_pool = forward_batch.token_to_kv_pool
@@ -131,19 +147,58 @@ def unified_linear_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-    ret = forward_batch.attn_backend.forward(
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        mixed_qkv=mixed_qkv[:real_num_tokens],
-        a=a[:real_num_tokens],
-        b=b[:real_num_tokens],
-    )
-    forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
-    ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
+    try:
+        ret = forward_batch.attn_backend.forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a[:real_num_tokens],
+            b=b[:real_num_tokens],
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+        if original_out_cache_loc_swa is not None and hasattr(
+            token_to_kv_pool, "set_swa_loc"
+        ):
+            token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     output[:, :real_num_tokens].copy_(ret)
     return
+
+
+def _try_unified_linear_attention_inner_cuda_graph(
+    *,
+    forward_batch: ForwardBatch,
+    attention_layer: RadixLinearAttention,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    real_num_tokens: int,
+) -> bool:
+    if not is_in_piecewise_cuda_graph() or is_in_pcg_torch_compile():
+        return False
+
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    if not isinstance(forward_batch.attn_backend, HybridLinearAttnBackend):
+        return False
+    linear_attn_backend = getattr(
+        forward_batch.attn_backend, "linear_attn_backend", None
+    )
+    try_run = getattr(linear_attn_backend, "try_run_qwen35_prefill_cuda_graph", None)
+    if try_run is None:
+        return False
+    return try_run(
+        layer=attention_layer,
+        forward_batch=forward_batch,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        real_num_tokens=real_num_tokens,
+        allow_capture=get_pcg_capture_stream() is not None,
+    )
