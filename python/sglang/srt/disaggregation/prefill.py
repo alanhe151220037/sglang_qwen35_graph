@@ -99,7 +99,6 @@ class PrefillBootstrapQueue:
     def __init__(
         self,
         token_to_kv_pool: KVCache,
-        draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         tp_rank: int,
@@ -114,7 +113,6 @@ class PrefillBootstrapQueue:
         transfer_backend: TransferBackend,
     ):
         self.token_to_kv_pool = token_to_kv_pool
-        self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -156,16 +154,6 @@ class PrefillBootstrapQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if self.draft_token_to_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
-            )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
@@ -186,7 +174,6 @@ class PrefillBootstrapQueue:
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )

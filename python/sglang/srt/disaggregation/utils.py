@@ -203,42 +203,21 @@ class MetadataBuffers:
             )
 
     def get_buf_infos(self):
-        ptrs = [
-            self.output_ids.data_ptr(),
-            self.cached_tokens.data_ptr(),
-            self.output_token_logprobs_val.data_ptr(),
-            self.output_token_logprobs_idx.data_ptr(),
-            self.output_top_logprobs_val.data_ptr(),
-            self.output_top_logprobs_idx.data_ptr(),
-            self.output_topk_p.data_ptr(),
-            self.output_topk_index.data_ptr(),
-            self.output_hidden_states.data_ptr(),
-            self.bootstrap_room.data_ptr(),
-        ]
-        data_lens = [
-            self.output_ids.nbytes,
-            self.cached_tokens.nbytes,
-            self.output_token_logprobs_val.nbytes,
-            self.output_token_logprobs_idx.nbytes,
-            self.output_top_logprobs_val.nbytes,
-            self.output_top_logprobs_idx.nbytes,
-            self.output_topk_p.nbytes,
-            self.output_topk_index.nbytes,
-            self.output_hidden_states.nbytes,
-            self.bootstrap_room.nbytes,
-        ]
-        item_lens = [
-            self.output_ids[0].nbytes,
-            self.cached_tokens[0].nbytes,
-            self.output_token_logprobs_val[0].nbytes,
-            self.output_token_logprobs_idx[0].nbytes,
-            self.output_top_logprobs_val[0].nbytes,
-            self.output_top_logprobs_idx[0].nbytes,
-            self.output_topk_p[0].nbytes,
-            self.output_topk_index[0].nbytes,
-            self.output_hidden_states[0].nbytes,
-            self.bootstrap_room[0].nbytes,
-        ]
+        # Speculative top-k and hidden-state inputs remain local to Decode.
+        # Their shapes and dtypes may differ when only Decode enables NEXTN,
+        # so they must not participate in PD auxiliary transfer.
+        transfer_tensors = (
+            self.output_ids,
+            self.cached_tokens,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
+            self.bootstrap_room,
+        )
+        ptrs = [tensor.data_ptr() for tensor in transfer_tensors]
+        data_lens = [tensor.nbytes for tensor in transfer_tensors]
+        item_lens = [tensor[0].nbytes for tensor in transfer_tensors]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
@@ -254,6 +233,11 @@ class MetadataBuffers:
             self.output_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
         )
+
+    def reset_speculative_buf(self, idx: int) -> None:
+        self.output_topk_p[idx].zero_()
+        self.output_topk_index[idx].zero_()
+        self.output_hidden_states[idx].zero_()
 
     def set_buf(self, req: Req):
 
@@ -552,7 +536,6 @@ def append_state_component(
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
-    draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
 ) -> None:
@@ -590,17 +573,6 @@ def setup_state_kv_args(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
-            if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, NSATokenToKVPool
-            ):
-                (
-                    draft_data_ptrs,
-                    draft_data_lens,
-                    draft_item_lens,
-                ) = draft_token_to_kv_pool.get_state_buf_infos()
-                data_ptrs = data_ptrs + draft_data_ptrs
-                data_lens = data_lens + draft_data_lens
-                item_lens = item_lens + draft_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num

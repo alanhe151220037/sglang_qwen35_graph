@@ -1029,12 +1029,10 @@ class Scheduler(
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
-            return draft_runner.token_to_kv_pool, draft_runner.model_config
+        else:
+            draft_runner = self.draft_worker.model_runner
 
-        return (
-            self.draft_worker.model_runner.token_to_kv_pool,
-            self.draft_worker.model_config,
-        )
+        return draft_runner.token_to_kv_pool, draft_runner.model_config
 
     def _maybe_register_hicache_draft(self) -> None:
         """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
@@ -1235,7 +1233,8 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
+        # Draft KV remains local to Decode. The pool is used only to initialize
+        # Decode-side draft pages and is never registered for PD transfer.
         draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
@@ -1322,7 +1321,6 @@ class Scheduler(
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,

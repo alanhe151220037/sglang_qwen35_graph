@@ -389,15 +389,6 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
-        if self.draft_token_to_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
-            )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -414,7 +405,6 @@ class DecodePreallocQueue:
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
@@ -980,7 +970,28 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
+            self.metadata_buffers.reset_speculative_buf(
+                decode_req.metadata_buffer_index
+            )
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            # Temporarily disable the PD decode KV-range diagnostic.
+            # if (
+            #     envs.SGLANG_LOG_PD_DECODE_KV_RANGES.get()
+            #     and self.tp_rank == 0
+            # ):
+            #     logger.info(
+            #         "PD decode KV ranges: rid=%s full_kv_tokens=[0, %d) "
+            #         "delta_kv_tokens=[%d, %d) prefix_hit=%d "
+            #         "allocated_kv_tokens=[0, %d) transfer_pages=%d page_size=%d",
+            #         decode_req.req.rid,
+            #         seq_len,
+            #         prefix_len,
+            #         seq_len,
+            #         prefix_len,
+            #         decode_req.req.kv_allocated_len,
+            #         len(page_indices),
+            #         page_size,
+            #     )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
