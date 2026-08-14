@@ -2578,6 +2578,15 @@ class ServerArgs:
                     == 0
                 ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
         elif not self.disable_radix_cache:  # no_buffer
+            full_kv_only_pd_decode_cache = (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_enable_radix_cache
+            )
+            if full_kv_only_pd_decode_cache:
+                # PD decode never caches Mamba states. Its radix endpoints only
+                # own page-aligned full KV, so no_buffer's MambaRadixCache
+                # page_size=1 and overlap restrictions do not apply.
+                return
             if self.page_size is not None and self.page_size != 1:
                 logger.warning(
                     f"{model_arch} with radix cache requires page_size=1 in the current "
@@ -4101,11 +4110,19 @@ class ServerArgs:
                         f"{self.disaggregation_transfer_backend!r}"
                     )
                 if self.speculative_algorithm is not None:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with speculative decoding "
-                        f"(--speculative-algorithm {self.speculative_algorithm})"
-                    )
+                    speculative_algorithm = self.speculative_algorithm.upper()
+                    if speculative_algorithm not in ("NEXTN", "EAGLE"):
+                        raise ValueError(
+                            "--disaggregation-decode-enable-radix-cache only "
+                            "supports single-layer NEXTN/EAGLE speculative "
+                            "decoding, but got --speculative-algorithm "
+                            f"{self.speculative_algorithm}"
+                        )
+                    if self.enable_multi_layer_eagle:
+                        raise ValueError(
+                            "--disaggregation-decode-enable-radix-cache does not "
+                            "support --enable-multi-layer-eagle"
+                        )
                 if self.enable_dp_attention:
                     logger.warning(
                         "EXPERIMENTAL: Decode radix cache with DP attention. "
@@ -4116,12 +4133,12 @@ class ServerArgs:
             else:
                 self.disable_radix_cache = True
                 logger.warning("KV cache is forced as chunk cache for decode server")
-                if self.enable_mamba_extra_buffer():
-                    logger.warning(
-                        "Mamba extra_buffer is disabled because decode disaggregation "
-                        "currently forces chunk cache. Falling back to no_buffer."
-                    )
-                    self.mamba_scheduler_strategy = "no_buffer"
+            if self.enable_mamba_extra_buffer():
+                logger.warning(
+                    "Mamba extra_buffer is disabled for decode disaggregation; "
+                    "decode-side radix cache stores full KV only. Falling back to no_buffer."
+                )
+                self.mamba_scheduler_strategy = "no_buffer"
 
         elif self.disaggregation_mode == "prefill":
             assert (

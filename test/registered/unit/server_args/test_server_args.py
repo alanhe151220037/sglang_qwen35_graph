@@ -85,6 +85,44 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("('nixl', 'mooncake')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
 
+    def test_pd_decode_radix_cache_allows_nextn(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+            speculative_algorithm="NEXTN",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_eagle3(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="mooncake",
+                speculative_algorithm="EAGLE3",
+            )
+
+        self.assertIn(
+            "only supports single-layer NEXTN/EAGLE", str(context.exception)
+        )
+
+    def test_pd_decode_radix_cache_rejects_multi_layer_eagle(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="mooncake",
+                speculative_algorithm="NEXTN",
+                enable_multi_layer_eagle=True,
+            )
+
+        self.assertIn("--enable-multi-layer-eagle", str(context.exception))
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")

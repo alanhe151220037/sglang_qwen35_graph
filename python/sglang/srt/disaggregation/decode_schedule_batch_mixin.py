@@ -61,7 +61,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                # ``cached_tokens`` is returned by the prefill worker through
+                # PD metadata. Decode-side radix hits overlap that prompt
+                # prefix and must not be added again to the user-facing cache
+                # hit count or observability metrics.
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)

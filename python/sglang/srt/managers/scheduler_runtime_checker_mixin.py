@@ -223,13 +223,18 @@ class SchedulerRuntimeCheckerMixin:
         return pool_stats
 
     def _get_mamba_token_info(self: Scheduler):
-        is_mamba_radix_cache = (
-            self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
-        )
+        is_tree_cache = self.tree_cache.is_tree_cache()
+        is_mamba_radix_cache = self.tree_cache.supports_mamba() and is_tree_cache
         full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
-        )
+        if is_mamba_radix_cache:
+            full_evictable_size = self.tree_cache.full_evictable_size()
+        elif is_tree_cache:
+            # PDDecodeRadixCache owns full KV but intentionally has no Mamba
+            # component. Its radix entries remain allocator-owned and must be
+            # included in the hybrid-SSM full-pool accounting.
+            full_evictable_size = self.tree_cache.evictable_size()
+        else:
+            full_evictable_size = 0
         mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
         mamba_evictable_size = (
             self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0

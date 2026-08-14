@@ -859,15 +859,22 @@ class Scheduler(
             server_args.disaggregation_decode_enable_radix_cache
             and server_args.disaggregation_mode == "decode"
         ):
+            if server_args.speculative_algorithm not in (None, "EAGLE"):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache only supports "
+                    "ordinary single-layer NEXTN/EAGLE after speculative "
+                    "algorithm resolution, but got "
+                    f"{server_args.speculative_algorithm}"
+                )
             if self.is_hybrid_swa:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with sliding window attention (SWA) models"
                 )
-            if self.is_hybrid_ssm:
+            if server_args.enable_multi_layer_eagle:
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with Mamba/SSM models"
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "multi-layer EAGLE"
                 )
 
         effective_chunked_prefill_size = server_args.chunked_prefill_size
@@ -907,7 +914,16 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+            if (
+                server_args.disaggregation_mode == "decode"
+                and server_args.disaggregation_decode_enable_radix_cache
+            ):
+                from sglang.srt.mem_cache.pd_decode_radix_cache import (
+                    PDDecodeRadixCache,
+                )
+
+                self.tree_cache = PDDecodeRadixCache(params)
+            elif envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
