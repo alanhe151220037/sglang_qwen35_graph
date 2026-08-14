@@ -612,6 +612,46 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:  # BATCH_STRINGS
             return texts  # Already in correct format: ["text1", "text2"]
 
+    def _can_use_encode_batch_fast(
+        self,
+        tokenizer_input: Union[List[str], List[List[str]]],
+        input_format: InputFormat,
+        is_cross_encoder: bool,
+    ) -> bool:
+        if is_cross_encoder or input_format not in (
+            InputFormat.SINGLE_STRING,
+            InputFormat.BATCH_STRINGS,
+        ):
+            return False
+
+        if not getattr(self.tokenizer, "is_fast", False):
+            return False
+
+        if not all(isinstance(item, str) for item in tokenizer_input):
+            return False
+
+        backend_tokenizer = getattr(self.tokenizer, "backend_tokenizer", None)
+        return backend_tokenizer is not None and hasattr(
+            backend_tokenizer, "encode_batch_fast"
+        )
+
+    def _encode_batch_fast_input_ids(
+        self, tokenizer_input: List[str]
+    ) -> List[List[int]]:
+        backend_tokenizer = self.tokenizer.backend_tokenizer
+        if hasattr(backend_tokenizer, "no_truncation"):
+            backend_tokenizer.no_truncation()
+        if hasattr(backend_tokenizer, "no_padding"):
+            backend_tokenizer.no_padding()
+        if hasattr(backend_tokenizer, "encode_special_tokens"):
+            backend_tokenizer.encode_special_tokens = getattr(
+                self.tokenizer, "split_special_tokens", False
+            )
+        encodings = backend_tokenizer.encode_batch_fast(
+            tokenizer_input, add_special_tokens=True
+        )
+        return [enc.ids for enc in encodings]
+
     def _extract_tokenizer_results(
         self,
         input_ids: List[List[int]],
@@ -684,7 +724,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Step 2: Set up tokenizer arguments
         tokenizer_kwargs = (
-            {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
+            {"return_token_type_ids": is_cross_encoder}
+            if is_cross_encoder
+            else {"return_attention_mask": False}
         )
 
         # Step 3: Choose tokenization strategy
@@ -694,7 +736,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         if use_async_tokenizer:
-            logger.debug("Using async dynamic batch tokenizer for single text")
+            # logger.debug("Using async dynamic batch tokenizer for single text")
             result = await self.async_dynamic_batch_tokenizer.encode(
                 tokenizer_input[0], **tokenizer_kwargs
             )
@@ -706,9 +748,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
         else:
-            logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
+            # logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
+            if self._can_use_encode_batch_fast(
+                tokenizer_input, input_format, is_cross_encoder
+            ):
+                # logger.debug(
+                #     f"Using backend encode_batch_fast for {len(tokenizer_input)} inputs"
+                # )
+                input_ids = self._encode_batch_fast_input_ids(tokenizer_input)
+                token_type_ids = None
+            elif not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
                 input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
                 token_type_ids = None
             else:
