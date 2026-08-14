@@ -2063,8 +2063,30 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                mamba_track_anchor_pos=recv_req.mamba_track_anchor_pos,
             )
             req.tokenizer = self.tokenizer
+
+            if (
+                envs.SGLANG_LOG_MAMBA_RADIX_TREE.get()
+                and recv_req.mamba_track_anchor_pos is not None
+                and self.tp_rank == 0
+            ):
+                anchor_seqlen = (
+                    recv_req.mamba_track_anchor_pos
+                    // self.server_args.mamba_cache_chunk_size
+                    * self.server_args.mamba_cache_chunk_size
+                )
+                logger.info(
+                    "Mamba track anchor pattern pair matched: rid=%s "
+                    "opening_pattern=%s closing_pattern=%s opening_pos=%s "
+                    "anchor_seqlen=%s",
+                    req.rid,
+                    self.server_args.mamba_track_anchor_token_pattern,
+                    self.server_args.mamba_track_anchor_end_token_pattern,
+                    recv_req.mamba_track_anchor_pos,
+                    anchor_seqlen,
+                )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

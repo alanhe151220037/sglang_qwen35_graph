@@ -990,6 +990,7 @@ class MMReceiverBase(ABC):
             ),
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
+            mamba_track_anchor_pos=recv_req.mamba_track_anchor_pos,
         )
         req.tokenizer = self.scheduler.tokenizer
         return req

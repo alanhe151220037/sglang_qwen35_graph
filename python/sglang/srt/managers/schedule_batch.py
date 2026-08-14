@@ -114,6 +114,39 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+def _select_mamba_track_target(
+    prefix_len: int,
+    extend_input_len: int,
+    alignment: int,
+    anchor_pos: Optional[int],
+    branching_seqlen: Optional[int],
+) -> Tuple[Optional[int], str]:
+    """Select the actual sequence length whose Mamba state should be tracked."""
+    assert alignment > 0
+    forward_end = prefix_len + extend_input_len
+    normal_target = prefix_len + (extend_input_len // alignment) * alignment
+    if normal_target == prefix_len:
+        normal_target = None
+
+    if (
+        branching_seqlen is not None
+        and branching_seqlen > prefix_len
+        and branching_seqlen <= forward_end
+        and (branching_seqlen - prefix_len) % alignment == 0
+    ):
+        return branching_seqlen, "branch"
+
+    if anchor_pos is None:
+        return normal_target, "normal"
+
+    anchor_seqlen = (anchor_pos // alignment) * alignment
+    if anchor_seqlen <= prefix_len:
+        return None, "anchor_already_reached"
+    if anchor_seqlen <= forward_end:
+        return anchor_seqlen, "anchor"
+    return normal_target, "normal_before_anchor"
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -620,6 +653,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        mamba_track_anchor_pos: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -700,6 +734,9 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Opening position of the final complete track-anchor pattern pair.
+        # Native SGLang sessions intentionally leave this unset for now.
+        self.mamba_track_anchor_pos = mamba_track_anchor_pos
 
         # Check finish
         self.tokenizer = None
@@ -1058,6 +1095,26 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+
+            if (
+                tree_cache.supports_mamba()
+                and envs.SGLANG_LOG_MAMBA_RADIX_TREE.get()
+                and get_tensor_model_parallel_rank() == 0
+            ):
+                logger.info(
+                    "Mamba request prefix result: rid=%s requested=%s prefix=%s "
+                    "extend=%s last_node=%s branching=%s anchor_pos=%s "
+                    "force_miss=%s extra_key_hash=%s",
+                    self.rid,
+                    len(token_ids),
+                    len(self.prefix_indices),
+                    len(self.fill_ids) - len(self.prefix_indices),
+                    getattr(self.last_node, "id", None),
+                    self.mamba_branching_seqlen,
+                    self.mamba_track_anchor_pos,
+                    envs.SGLANG_RADIX_FORCE_MISS.get(),
+                    hash(self.extra_key) if self.extra_key is not None else None,
+                )
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -2022,13 +2079,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return i + 1
 
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
-        mask = req.extend_input_len >= mamba_cache_chunk_size
+        prefix_len = len(req.prefix_indices)
+        forward_end = prefix_len + req.extend_input_len
+        track_target, track_reason = _select_mamba_track_target(
+            prefix_len=prefix_len,
+            extend_input_len=req.extend_input_len,
+            alignment=mamba_cache_chunk_size,
+            anchor_pos=req.mamba_track_anchor_pos,
+            branching_seqlen=req.mamba_branching_seqlen,
+        )
+        mask = track_target is not None
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         )
         mamba_track_seqlen = -1
-        if mask:
+        if track_target is not None:
             # mamba_track_seqlen is used to calculate the indices to track in
             # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
             # fact that the ssm state between aligned and non-aligned are retrieved differently,
@@ -2036,25 +2102,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+            mamba_track_seqlen = forward_end
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
-            mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_input_len // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
+            mamba_track_seqlen_aligned = track_target
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
             # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
             # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
+                prefix_len
                 + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+            if track_reason in ("branch", "anchor"):
+                if mamba_track_seqlen_aligned < forward_end:
+                    mamba_track_seqlen = _force_track_h(
+                        mamba_track_seqlen_aligned
+                    )
+            elif mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
@@ -2064,23 +2131,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.mamba_next_track_idx
                 )
             )
-            if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
-                branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % mamba_cache_chunk_size == 0
-                if (
-                    req.mamba_branching_seqlen > len(req.prefix_indices)
-                    and req.mamba_branching_seqlen < mamba_track_seqlen
-                    and branching_seqlen_aligned_mask
-                ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+        elif req.mamba_track_anchor_pos is not None:
+            req.mamba_last_track_seqlen = None
+
+        if (
+            envs.SGLANG_LOG_MAMBA_RADIX_TREE.get()
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            anchor_seqlen = (
+                (req.mamba_track_anchor_pos // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
+                if req.mamba_track_anchor_pos is not None
+                else None
+            )
+            logger.info(
+                "Mamba track selection: rid=%s pattern_pos=%s anchor=%s "
+                "prefix=%s forward_end=%s selected=%s reason=%s branching=%s",
+                req.rid,
+                req.mamba_track_anchor_pos,
+                anchor_seqlen,
+                prefix_len,
+                forward_end,
+                track_target,
+                track_reason,
+                req.mamba_branching_seqlen,
+            )
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def prepare_for_split_prefill(self):

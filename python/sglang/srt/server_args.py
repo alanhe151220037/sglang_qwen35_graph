@@ -653,6 +653,8 @@ class ServerArgs:
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
+    mamba_track_anchor_token_pattern: Optional[List[int]] = None
+    mamba_track_anchor_end_token_pattern: Optional[List[int]] = None
     mamba_track_interval: int = 256
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
@@ -1186,6 +1188,46 @@ class ServerArgs:
             # TODO: when extra_buffer is more verified, we can set the default path based on
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
+
+        anchor_pattern_args = (
+            (
+                "--mamba-track-anchor-token-pattern",
+                "mamba_track_anchor_token_pattern",
+            ),
+            (
+                "--mamba-track-anchor-end-token-pattern",
+                "mamba_track_anchor_end_token_pattern",
+            ),
+        )
+        configured_anchor_patterns = [
+            getattr(self, attr_name) is not None
+            for _, attr_name in anchor_pattern_args
+        ]
+        if any(configured_anchor_patterns) and not all(configured_anchor_patterns):
+            raise ValueError(
+                "--mamba-track-anchor-token-pattern and "
+                "--mamba-track-anchor-end-token-pattern must be specified together"
+            )
+        if all(configured_anchor_patterns):
+            for arg_name, attr_name in anchor_pattern_args:
+                pattern = list(getattr(self, attr_name))
+                if not pattern:
+                    raise ValueError(f"{arg_name} must not be empty")
+                if any(
+                    isinstance(token_id, bool)
+                    or not isinstance(token_id, int)
+                    or token_id < 0
+                    for token_id in pattern
+                ):
+                    raise ValueError(
+                        f"{arg_name} must contain only non-negative token ids"
+                    )
+                setattr(self, attr_name, pattern)
+            if not self.enable_mamba_extra_buffer():
+                raise ValueError(
+                    "Mamba track-anchor token patterns require "
+                    "--mamba-scheduler-strategy extra_buffer"
+                )
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -6261,6 +6303,25 @@ class ServerArgs:
             choices=MAMBA_SCHEDULER_STRATEGY_CHOICES,
             default=ServerArgs.mamba_scheduler_strategy,
             help="The strategy to use for mamba radix cache.",
+        )
+        parser.add_argument(
+            "--mamba-track-anchor-token-pattern",
+            type=int,
+            nargs="+",
+            default=ServerArgs.mamba_track_anchor_token_pattern,
+            help="Track the prefill Mamba state at the last cache-aligned "
+            "position before the opening pattern of the final complete "
+            "opening/closing token-pattern pair. Requires "
+            "--mamba-track-anchor-end-token-pattern and "
+            "--mamba-scheduler-strategy extra_buffer.",
+        )
+        parser.add_argument(
+            "--mamba-track-anchor-end-token-pattern",
+            type=int,
+            nargs="+",
+            default=ServerArgs.mamba_track_anchor_end_token_pattern,
+            help="Closing token-id pattern paired with "
+            "--mamba-track-anchor-token-pattern.",
         )
         parser.add_argument(
             "--mamba-track-interval",

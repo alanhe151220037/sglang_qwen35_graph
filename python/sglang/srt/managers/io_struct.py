@@ -728,6 +728,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to stream output
     stream: bool
 
+    # Opening position of the final complete Mamba track-anchor pattern pair.
+    mamba_track_anchor_pos: Optional[int] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 

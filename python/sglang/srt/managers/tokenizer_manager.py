@@ -125,6 +125,49 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+
+def _find_last_token_pattern(
+    input_ids: Optional[List[int]],
+    pattern: Optional[List[int]],
+    search_end: Optional[int] = None,
+) -> Optional[int]:
+    """Return the start of the final exact pattern match before search_end."""
+    if not input_ids or not pattern or len(pattern) > len(input_ids):
+        return None
+
+    pattern_len = len(pattern)
+    search_end = (
+        len(input_ids) if search_end is None else min(search_end, len(input_ids))
+    )
+    if search_end < pattern_len:
+        return None
+    first_token = pattern[0]
+    for start in range(search_end - pattern_len, -1, -1):
+        if input_ids[start] != first_token:
+            continue
+        if all(
+            input_ids[start + offset] == token
+            for offset, token in enumerate(pattern)
+        ):
+            return start
+    return None
+
+
+def _find_last_enclosed_token_pattern(
+    input_ids: Optional[List[int]],
+    opening_pattern: Optional[List[int]],
+    closing_pattern: Optional[List[int]],
+) -> Optional[int]:
+    """Return the opening position of the final complete pattern pair."""
+    closing_start = _find_last_token_pattern(input_ids, closing_pattern)
+    if closing_start is None:
+        return None
+    return _find_last_token_pattern(
+        input_ids,
+        opening_pattern,
+        search_end=closing_start,
+    )
+
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
@@ -271,6 +314,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
+        patterns = (
+            (
+                "--mamba-track-anchor-token-pattern",
+                self.server_args.mamba_track_anchor_token_pattern,
+            ),
+            (
+                "--mamba-track-anchor-end-token-pattern",
+                self.server_args.mamba_track_anchor_end_token_pattern,
+            ),
+        )
+        vocab_size = self.model_config.vocab_size
+        if vocab_size is not None:
+            for arg_name, pattern in patterns:
+                if pattern is not None and any(
+                    token_id >= vocab_size for token_id in pattern
+                ):
+                    raise ValueError(
+                        f"{arg_name} contains a token id outside the model "
+                        f"vocabulary (vocab_size={vocab_size})"
+                    )
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
@@ -1067,6 +1130,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            mamba_track_anchor_pos = None
+            opening_pattern = (
+                self.server_args.mamba_track_anchor_token_pattern
+                if self.server_args.enable_mamba_extra_buffer()
+                else None
+            )
+            closing_pattern = (
+                self.server_args.mamba_track_anchor_end_token_pattern
+                if self.server_args.enable_mamba_extra_buffer()
+                else None
+            )
+            if (
+                input_embeds is None
+                and opening_pattern is not None
+                and closing_pattern is not None
+            ):
+                mamba_track_anchor_pos = _find_last_enclosed_token_pattern(
+                    input_ids,
+                    opening_pattern,
+                    closing_pattern,
+                )
+
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -1089,6 +1174,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.top_logprobs_num,
                 obj.token_ids_logprob,
                 obj.stream,
+                mamba_track_anchor_pos=mamba_track_anchor_pos,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
