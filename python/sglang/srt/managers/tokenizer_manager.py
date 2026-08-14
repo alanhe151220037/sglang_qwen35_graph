@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -144,6 +145,7 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+    tokenizer_response_time_stats_logged: bool = False
 
     # For streaming output
     last_output_offset: int = 0
@@ -340,6 +342,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+        logger.info(
+            "Tokenizer initialized: class=%s, is_fast=%s, backend=%s, path=%s, "
+            "dynamic_batch=%s, dynamic_batch_size=%s, dynamic_batch_timeout=%s",
+            (
+                self.tokenizer.__class__.__name__
+                if self.tokenizer is not None
+                else None
+            ),
+            getattr(self.tokenizer, "is_fast", None),
+            server_args.tokenizer_backend,
+            server_args.tokenizer_path,
+            self.async_dynamic_batch_tokenizer is not None,
+            server_args.dynamic_batch_tokenizer_batch_size,
+            server_args.dynamic_batch_tokenizer_batch_timeout,
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -710,6 +728,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        self._set_tokenize_start_time(obj)
+
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -742,9 +762,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
+                tokenize_texts_start_time = time.perf_counter()
                 input_ids, token_type_ids = await self._tokenize_texts(
                     input_text, is_cross_encoder_request
                 )
+                state = self.rid_to_state.get(obj.rid)
+                if state is not None:
+                    state.time_stats.tokenize_texts_start_time = (
+                        tokenize_texts_start_time
+                    )
+                    state.time_stats.tokenize_texts_finish_time = time.perf_counter()
 
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
@@ -1106,6 +1133,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
+        for req in requests:
+            self._set_tokenize_start_time(req)
         texts = [req.text for req in requests]
 
         # Check if any request is a cross-encoder request
@@ -1115,9 +1144,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Batch tokenize all texts using unified method
+        tokenize_texts_start_time = time.perf_counter()
         input_ids_list, token_type_ids_list = await self._tokenize_texts(
             texts, is_cross_encoder_request
         )
+        tokenize_texts_finish_time = time.perf_counter()
+        for req in requests:
+            state = self.rid_to_state.get(req.rid)
+            if state is not None:
+                state.time_stats.tokenize_texts_start_time = tokenize_texts_start_time
+                state.time_stats.tokenize_texts_finish_time = tokenize_texts_finish_time
 
         # Process all requests
         tokenized_objs = []
@@ -1204,6 +1240,80 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         self.send_to_scheduler.send_pyobj(batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+
+    def _set_tokenize_start_time(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        state = self.rid_to_state.get(obj.rid)
+        if state is None or state.time_stats.tokenize_start_time > 0.0:
+            return
+        state.time_stats.set_tokenize_start_time()
+
+    def _duration_field(self, start: float, end: float) -> str:
+        duration = 0.0 if start <= 0.0 or end <= 0.0 else end - start
+        return f"{duration * 1e3:.2f}ms"
+
+    def _maybe_log_tokenizer_time_stats(
+        self,
+        rid: str,
+        state: ReqState,
+        stage: str,
+        *,
+        prompt_tokens: Optional[int] = None,
+        cached_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        scheduler_time_stats=None,
+    ) -> None:
+        if (
+            not self.server_args.enable_request_time_stats_logging
+            or not getattr(state.obj, "log_metrics", True)
+        ):
+            return
+
+        if stage == "response_sent":
+            if state.tokenizer_response_time_stats_logged:
+                return
+            state.tokenizer_response_time_stats_logged = True
+
+        stats = state.time_stats
+        scheduler_completion_to_tokenizer = "n/a"
+        if scheduler_time_stats is not None and getattr(
+            scheduler_time_stats, "completion_time", 0.0
+        ):
+            scheduler_completion_to_tokenizer = self._duration_field(
+                scheduler_time_stats.completion_time,
+                stats.first_token_time or stats.finished_time,
+            )
+
+        input_ids = getattr(state.obj, "input_ids", None)
+        input_len = len(input_ids) if input_ids is not None else "n/a"
+        bootstrap_info = (
+            f", bootstrap_room={state.obj.bootstrap_room}"
+            if getattr(state.obj, "bootstrap_room", None) is not None
+            else ""
+        )
+        logger.info(
+            "TokenizerReqTimeStats("
+            f"rid={rid}{bootstrap_info}, "
+            f"input_len={input_len}, "
+            f"prompt_tokens={prompt_tokens}, "
+            f"cached_tokens={cached_tokens}, "
+            f"completion_tokens={completion_tokens}, "
+            f"output_len={len(state.output_ids)}, "
+            f"type={stats.disagg_mode_str()}, "
+            f"stage={stage}): "
+            f"request_to_tokenize_start={self._duration_field(stats.created_time, stats.tokenize_start_time)}, "
+            f"tokenize_duration={self._duration_field(stats.tokenize_start_time, stats.tokenize_finish_time)}, "
+            f"tokenize_texts_duration={self._duration_field(stats.tokenize_texts_start_time, stats.tokenize_texts_finish_time)}, "
+            f"tokenize_to_dispatch={self._duration_field(stats.tokenize_finish_time, stats.api_server_dispatch_time)}, "
+            f"dispatch_duration={self._duration_field(stats.api_server_dispatch_time, stats.api_server_dispatch_finish_time)}, "
+            f"dispatch_to_first_token={self._duration_field(stats.api_server_dispatch_finish_time, stats.first_token_time)}, "
+            f"ttft={self._duration_field(stats.created_time, stats.first_token_time)}, "
+            f"decode_or_wait_after_first={self._duration_field(stats.first_token_time, stats.finished_time)}, "
+            f"first_token_to_response_sent={self._duration_field(stats.first_token_time, stats.response_sent_to_client_time)}, "
+            f"e2e={self._duration_field(stats.created_time, stats.finished_time)}, "
+            f"scheduler_completion_to_tokenizer={scheduler_completion_to_tokenizer}"
+        )
 
     def _coalesce_streaming_chunks(
         self,
@@ -1344,6 +1454,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                self._maybe_log_tokenizer_time_stats(
+                    obj.rid,
+                    state,
+                    "response_sent",
+                    prompt_tokens=out["meta_info"].get("prompt_tokens"),
+                    cached_tokens=out["meta_info"].get("cached_tokens"),
+                    completion_tokens=out["meta_info"].get("completion_tokens"),
+                )
                 self.request_logger.log_finished_request(
                     obj,
                     out,

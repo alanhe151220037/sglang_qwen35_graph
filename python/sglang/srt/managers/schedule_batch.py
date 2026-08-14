@@ -1518,6 +1518,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+    disagg_prefill_overlap_chunk_ids: Optional[List[int]] = None
     forward_iter: Optional[int] = None
 
     # HiSparse
@@ -2648,6 +2649,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+            disagg_prefill_overlap_chunk_ids=self.disagg_prefill_overlap_chunk_ids,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
         )

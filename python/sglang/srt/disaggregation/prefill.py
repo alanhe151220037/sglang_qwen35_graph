@@ -56,7 +56,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.observability.req_time_stats import (
+    monotonic_time,
+    set_schedule_time_batch,
+)
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -360,6 +363,65 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _record_disagg_prefill_overlap_get_next(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        if not envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get():
+            return
+        if batch is None:
+            return
+        next_chunk_id = getattr(self, "_disagg_prefill_overlap_next_chunk_id", 0)
+        chunk_ids = []
+        batch_size = batch.batch_size()
+        for req in batch.reqs:
+            chunk_id = next_chunk_id
+            next_chunk_id += 1
+            chunk_ids.append(chunk_id)
+            req.time_stats.add_disagg_prefill_overlap_chunk(
+                chunk_id,
+                batch_size=batch_size,
+                extend_input_len=getattr(req, "extend_input_len", None),
+                seq_len=len(req.fill_ids) if getattr(req, "fill_ids", None) else None,
+            )
+            req.time_stats.record_disagg_prefill_overlap_stage(
+                chunk_id, "get_next", start_time, end_time
+            )
+        batch.disagg_prefill_overlap_chunk_ids = chunk_ids
+        self._disagg_prefill_overlap_next_chunk_id = next_chunk_id
+
+    def _record_disagg_prefill_overlap_batch_stage(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        stage: str,
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        if not envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get():
+            return
+        chunk_ids = getattr(batch, "disagg_prefill_overlap_chunk_ids", None)
+        if not chunk_ids:
+            return
+        for req, chunk_id in zip(batch.reqs, chunk_ids, strict=False):
+            req.time_stats.record_disagg_prefill_overlap_stage(
+                chunk_id, stage, start_time, end_time
+            )
+
+    def _record_disagg_prefill_overlap_copy_wait(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        duration: float,
+    ) -> None:
+        if not envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get():
+            return
+        chunk_ids = getattr(batch, "disagg_prefill_overlap_chunk_ids", None)
+        if not chunk_ids:
+            return
+        for req, chunk_id in zip(batch.reqs, chunk_ids, strict=False):
+            req.time_stats.record_disagg_prefill_overlap_copy_wait(chunk_id, duration)
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -425,6 +487,10 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_disagg_prefill_overlap_time_stats = (
+            envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get()
+        )
+        self._disagg_prefill_overlap_next_chunk_id = 0
 
         while True:
             # Receive requests
@@ -437,14 +503,34 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             # Get the next batch to run
+            get_next_start = (
+                monotonic_time()
+                if self.enable_disagg_prefill_overlap_time_stats
+                else 0.0
+            )
             batch = self.get_next_disagg_prefill_batch_to_run()
+            if self.enable_disagg_prefill_overlap_time_stats:
+                get_next_end = monotonic_time()
+                self._record_disagg_prefill_overlap_get_next(
+                    batch, get_next_start, get_next_end
+                )
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                run_batch_start = (
+                    monotonic_time()
+                    if self.enable_disagg_prefill_overlap_time_stats
+                    else 0.0
+                )
                 batch_result = self.run_batch(batch)
+                if self.enable_disagg_prefill_overlap_time_stats:
+                    run_batch_end = monotonic_time()
+                    self._record_disagg_prefill_overlap_batch_stage(
+                        batch, "run_batch", run_batch_start, run_batch_end
+                    )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -475,6 +561,11 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
+        enable_overlap_time_stats = (
+            envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get()
+        )
+        process_start = monotonic_time() if enable_overlap_time_stats else 0.0
+        copy_done_wait = 0.0
         (
             logits_output,
             next_token_ids,
@@ -490,7 +581,12 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if copy_done is not None:
+            copy_done_wait_start = (
+                monotonic_time() if enable_overlap_time_stats else 0.0
+            )
             copy_done.synchronize()
+            if enable_overlap_time_stats:
+                copy_done_wait = monotonic_time() - copy_done_wait_start
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -593,6 +689,12 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        if enable_overlap_time_stats:
+            process_end = monotonic_time()
+            self._record_disagg_prefill_overlap_batch_stage(
+                batch, "process_result", process_start, process_end
+            )
+            self._record_disagg_prefill_overlap_copy_wait(batch, copy_done_wait)
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

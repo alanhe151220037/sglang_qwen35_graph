@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -329,7 +330,10 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     finished_time: float = 0.0
     first_token_time: float = 0.0
     last_time: float = 0.0
+    tokenize_start_time: float = 0.0
     tokenize_finish_time: float = 0.0
+    tokenize_texts_start_time: float = 0.0
+    tokenize_texts_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
@@ -368,12 +372,17 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.last_time = ts
 
+    def set_tokenize_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.tokenize_start_time = ts
+
     def set_tokenize_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.tokenize_finish_time = ts
 
         stage = RequestStage.TOKENIZE
-        self.trace_slice(stage, self.created_time, ts)
+        start_time = self.tokenize_start_time or self.created_time
+        self.trace_slice(stage, start_time, ts)
 
     def set_api_server_dispatch_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -575,6 +584,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
+
+    # Per-chunk timing details for overlap disaggregated prefill.
+    disagg_prefill_overlap_chunks: Optional[List[Dict[str, Any]]] = None
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
@@ -835,6 +847,123 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.abort()
 
+    def add_disagg_prefill_overlap_chunk(
+        self,
+        chunk_id: int,
+        *,
+        batch_size: int,
+        extend_input_len: Optional[int] = None,
+        seq_len: Optional[int] = None,
+    ):
+        if self.disagg_prefill_overlap_chunks is None:
+            self.disagg_prefill_overlap_chunks = []
+        record = {
+            "chunk_id": chunk_id,
+            "batch_size": batch_size,
+            "extend_input_len": extend_input_len,
+            "seq_len": seq_len,
+        }
+        self.disagg_prefill_overlap_chunks.append(record)
+
+    def _get_disagg_prefill_overlap_chunk(
+        self, chunk_id: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        if not self.disagg_prefill_overlap_chunks:
+            return None
+        if chunk_id is None:
+            return self.disagg_prefill_overlap_chunks[-1]
+        for record in reversed(self.disagg_prefill_overlap_chunks):
+            if record.get("chunk_id") == chunk_id:
+                return record
+        return None
+
+    def record_disagg_prefill_overlap_stage(
+        self,
+        chunk_id: int,
+        stage: str,
+        start_time: float,
+        end_time: float,
+    ):
+        record = self._get_disagg_prefill_overlap_chunk(chunk_id)
+        if record is None:
+            return
+        record[f"{stage}_start"] = start_time
+        record[f"{stage}_end"] = end_time
+        record[f"{stage}_duration"] = end_time - start_time
+
+    def record_disagg_prefill_overlap_copy_wait(
+        self,
+        chunk_id: int,
+        duration: float,
+    ):
+        record = self._get_disagg_prefill_overlap_chunk(chunk_id)
+        if record is None:
+            return
+        record["copy_done_sync_wait"] = duration
+
+    def format_disagg_prefill_overlap_chunks(self) -> str:
+        if (
+            not envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get()
+            or not self.disagg_prefill_overlap_chunks
+        ):
+            return ""
+
+        def _fmt_value(value: Optional[float]) -> str:
+            return "n/a" if value is None else self.format_duration(value)
+
+        def _gap(
+            record: Dict[str, Any],
+            prev_stage: str,
+            next_stage: str,
+            *,
+            next_start_key: Optional[str] = None,
+        ) -> Optional[float]:
+            prev_end = record.get(f"{prev_stage}_end")
+            next_start = record.get(next_start_key or f"{next_stage}_start")
+            if prev_end is None or next_start is None:
+                return None
+            return next_start - prev_end
+
+        chunk_strs = []
+        for idx, record in enumerate(self.disagg_prefill_overlap_chunks):
+            get_next = record.get("get_next_duration")
+            run_batch = record.get("run_batch_duration")
+            process_result = record.get("process_result_duration")
+            copy_wait = record.get("copy_done_sync_wait")
+            get_to_run = _gap(record, "get_next", "run_batch")
+            run_to_process = _gap(record, "run_batch", "process_result")
+
+            chunk_strs.append(
+                "chunk"
+                f"{idx}(id={record.get('chunk_id')}, "
+                f"bs={record.get('batch_size')}, "
+                f"extend={record.get('extend_input_len')}, "
+                f"seq={record.get('seq_len')}, "
+                f"get_next={_fmt_value(get_next)}, "
+                f"gap_get_run={_fmt_value(get_to_run)}, "
+                f"run_batch={_fmt_value(run_batch)}, "
+                f"gap_run_process={_fmt_value(run_to_process)}, "
+                f"process_result={_fmt_value(process_result)}, "
+                f"copy_wait={_fmt_value(copy_wait)})"
+            )
+        return "; overlap_prefill_chunks=[" + "; ".join(chunk_strs) + "]"
+
+    def format_prefill_last_chunk_transfer_duration(self) -> str:
+        if (
+            not envs.SGLANG_LOG_DISAGG_PREFILL_OVERLAP_TIME_STATS.get()
+            or self.prefill_transfer_queue_entry_time <= 0.0
+            or self.prefill_kv_transfer_finish_time <= 0.0
+        ):
+            return ""
+        transfer_duration = (
+            self.prefill_kv_transfer_finish_time
+            - self.prefill_transfer_queue_entry_time
+        )
+        return (
+            "; last_chunk_transfer_duration="
+            f"{self.format_duration(transfer_duration)}"
+        )
+
     def compute_and_observe_kv_transfer_metrics(
         self,
         transfer_metric: KVTransferMetric,
@@ -1026,6 +1155,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 )
             else:
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
+            overlap_prefill_breakdown = self.format_disagg_prefill_overlap_chunks()
+            last_chunk_transfer_duration = (
+                self.format_prefill_last_chunk_transfer_duration()
+            )
 
             return (
                 f"{bootstrap_fields}"
@@ -1035,6 +1168,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
                 f"transfer_total={self.transfer_total_mb:.2f} MB, "
                 f"#retries={self.prefill_retry_count}"
+                f"{overlap_prefill_breakdown}"
+                f"{last_chunk_transfer_duration}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = self.duration_between(
