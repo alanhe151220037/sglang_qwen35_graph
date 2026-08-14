@@ -516,6 +516,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+                query_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1226,6 +1228,14 @@ class FlashInferIndicesUpdaterPrefill:
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
+        max_bs = self.kv_indptr[0].numel() - 1
+        # Keep this pageable: FlashInfer may enqueue an H2D copy from it with
+        # non_blocking=True, and this buffer is reused by the next batch.
+        self.plan_kv_lens_cpu = torch.empty(max_bs, dtype=torch.int32)
+        self.plan_q_lens_cpu = torch.empty(max_bs, dtype=torch.int32)
+        self.plan_kv_indptr_cpu = torch.empty(max_bs + 1, dtype=torch.int32)
+        self.plan_qo_indptr_cpu = torch.empty(max_bs + 1, dtype=torch.int32)
+
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             self.update = self.update_sliding_window
@@ -1234,6 +1244,48 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
+
+    def _build_cpu_plan_kwargs(
+        self,
+        paged_kernel_lens_cpu: Optional[Union[List[int], torch.Tensor]],
+        query_lens_cpu: Optional[Union[List[int], torch.Tensor]],
+        bs: int,
+    ):
+        if (
+            paged_kernel_lens_cpu is None
+            or len(paged_kernel_lens_cpu) != bs
+            or query_lens_cpu is None
+            or len(query_lens_cpu) != bs
+            or (
+                isinstance(paged_kernel_lens_cpu, torch.Tensor)
+                and paged_kernel_lens_cpu.device.type != "cpu"
+            )
+            or (
+                isinstance(query_lens_cpu, torch.Tensor)
+                and query_lens_cpu.device.type != "cpu"
+            )
+        ):
+            return {}
+
+        kv_lens_cpu = self.plan_kv_lens_cpu[:bs]
+        q_lens_cpu = self.plan_q_lens_cpu[:bs]
+        kv_lens_cpu.copy_(
+            torch.as_tensor(paged_kernel_lens_cpu, dtype=torch.int32)
+        )
+        q_lens_cpu.copy_(torch.as_tensor(query_lens_cpu, dtype=torch.int32))
+
+        kv_indptr_cpu = self.plan_kv_indptr_cpu[: bs + 1]
+        qo_indptr_cpu = self.plan_qo_indptr_cpu[: bs + 1]
+        kv_indptr_cpu[0] = 0
+        qo_indptr_cpu[0] = 0
+        torch.cumsum(kv_lens_cpu, dim=0, out=kv_indptr_cpu[1:])
+        torch.cumsum(q_lens_cpu, dim=0, out=qo_indptr_cpu[1:])
+
+        return {
+            "qo_indptr_cpu": qo_indptr_cpu,
+            "paged_kv_indptr_cpu": kv_indptr_cpu,
+            "kv_lens_cpu": kv_lens_cpu,
+        }
 
     def update(
         self,
@@ -1249,6 +1301,8 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        query_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
+        prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1267,15 +1321,23 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        query_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
+        prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
     ):
         if use_ragged:
-            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
-            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            if prefix_lens_cpu is not None and len(prefix_lens_cpu) == len(seq_lens):
+                paged_kernel_lens_sum = int(
+                    torch.as_tensor(prefix_lens_cpu, dtype=torch.int64).sum().item()
+                )
+                paged_kernel_lens_cpu = prefix_lens_cpu
+            else:
+                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                paged_kernel_lens_cpu = None
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
+            paged_kernel_lens_cpu = seq_lens_cpu
 
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
@@ -1292,6 +1354,8 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            paged_kernel_lens_cpu=paged_kernel_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
         )
 
     def update_sliding_window(
@@ -1308,6 +1372,8 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        query_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
+        prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1358,6 +1424,8 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        query_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
+        prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1408,6 +1476,8 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        paged_kernel_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
+        query_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1480,6 +1550,16 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        cpu_plan_kwargs = {}
+        if (
+            spec_info is None
+            and kv_start_idx is None
+            and use_custom_mask is None
+        ):
+            cpu_plan_kwargs = self._build_cpu_plan_kwargs(
+                paged_kernel_lens_cpu, query_lens_cpu, bs
+            )
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -1498,6 +1578,7 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
+            **cpu_plan_kwargs,
         )
 
 

@@ -850,11 +850,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         full_attn_backend: AttentionBackend,
         linear_attn_backend: MambaAttnBackendBase,
         full_attn_layers: list[int],
+        enable_linear_attn_metadata: bool = True,
     ):
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
-        self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        self.enable_linear_attn_metadata = enable_linear_attn_metadata
+        self.attn_backend_list = [full_attn_backend]
+        if enable_linear_attn_metadata:
+            self.attn_backend_list.append(linear_attn_backend)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
@@ -1018,6 +1022,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         is_linear_attn = layer_id not in self.full_attn_layers
+        if is_linear_attn and not self.enable_linear_attn_metadata:
+            raise RuntimeError(
+                "Linear attention layer was dispatched after linear attention "
+                "metadata was disabled for a full-attention-only draft worker: "
+                f"layer_id={layer_id}."
+            )
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:

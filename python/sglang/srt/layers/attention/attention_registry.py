@@ -209,6 +209,36 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+def _draft_uses_only_full_attention(
+    runner: "ModelRunner", full_attn_layers: list[int]
+) -> bool:
+    if not runner.is_draft_worker:
+        return False
+
+    # Qwen3.5 MTP wraps the one-layer draft model, so ModelRunner's fallback
+    # layer range can still reflect the target config. For hybrid GDN models,
+    # inspect the loaded modules directly: these are the exact module types
+    # consumed by HybridLinearAttnBackend.forward().
+    if getattr(runner, "hybrid_gdn_config", None) is not None:
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+        has_full_attention = False
+        has_linear_attention = False
+        for module in runner.model.modules():
+            has_full_attention |= isinstance(module, RadixAttention)
+            has_linear_attention |= isinstance(module, RadixLinearAttention)
+        if has_full_attention or has_linear_attention:
+            return has_full_attention and not has_linear_attention
+
+    active_layer_ids = range(runner.start_layer, runner.end_layer)
+    if len(active_layer_ids) == 0:
+        return False
+
+    full_attn_layer_set = set(full_attn_layers)
+    return all(layer_id in full_attn_layer_set for layer_id in active_layer_ids)
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't
@@ -281,8 +311,19 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "from sglang.srt.configs.linear_attn_model_registry."
                 )
         full_attn_layers = cfg.full_attention_layer_ids
+        enable_linear_attn_metadata = not _draft_uses_only_full_attention(
+            runner, full_attn_layers
+        )
+        if not enable_linear_attn_metadata:
+            logger.info(
+                "Skipping linear attention metadata for full-attention-only "
+                "draft worker."
+            )
         return HybridLinearAttnBackend(
-            full_attn_backend, linear_attn_backend, full_attn_layers
+            full_attn_backend,
+            linear_attn_backend,
+            full_attn_layers,
+            enable_linear_attn_metadata=enable_linear_attn_metadata,
         )
 
     return full_attn_backend

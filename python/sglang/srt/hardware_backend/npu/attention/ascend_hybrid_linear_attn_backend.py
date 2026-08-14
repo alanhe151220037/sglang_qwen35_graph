@@ -214,8 +214,14 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         full_attn_backend: AttentionBackend,
         linear_attn_backend: AscendMambaAttnBackendBase,
         full_attn_layers: list[int],
+        enable_linear_attn_metadata: bool = True,
     ):
-        super().__init__(full_attn_backend, linear_attn_backend, full_attn_layers)
+        super().__init__(
+            full_attn_backend,
+            linear_attn_backend,
+            full_attn_layers,
+            enable_linear_attn_metadata=enable_linear_attn_metadata,
+        )
 
     def update_mamba_state_after_mtp_verify(
         self,
