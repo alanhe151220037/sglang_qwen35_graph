@@ -133,6 +133,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        append_final_state_to_h: bool = False,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -150,6 +151,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
+            append_final_state_to_h=append_final_state_to_h,
             **recurrent_state_indices_args,
         )
 

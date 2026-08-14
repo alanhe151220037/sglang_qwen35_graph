@@ -62,8 +62,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    APPEND_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
+    TOTAL_NT: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -279,6 +281,44 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
+        if APPEND_FINAL_STATE:
+            final_h = h + (TOTAL_NT + i_n - boh).to(tl.int64) * stride_h
+            p_final_h = tl.make_block_ptr(
+                final_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+            )
+            tl.store(
+                p_final_h,
+                b_h1.to(p_final_h.dtype.element_ty),
+                boundary_check=(0, 1),
+            )
+            if K > 64:
+                p_final_h = tl.make_block_ptr(
+                    final_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                )
+                tl.store(
+                    p_final_h,
+                    b_h2.to(p_final_h.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+            if K > 128:
+                p_final_h = tl.make_block_ptr(
+                    final_h, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                )
+                tl.store(
+                    p_final_h,
+                    b_h3.to(p_final_h.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+            if K > 192:
+                p_final_h = tl.make_block_ptr(
+                    final_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                )
+                tl.store(
+                    p_final_h,
+                    b_h4.to(p_final_h.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+
 
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
@@ -289,6 +329,7 @@ def chunk_gated_delta_rule_fwd_h(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     save_new_value: bool = True,
+    append_final_state_to_h: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -307,9 +348,11 @@ def chunk_gated_delta_rule_fwd_h(
             len(chunk_indices),
             prepare_chunk_offsets(cu_seqlens, BT),
         )
+    if append_final_state_to_h and cu_seqlens is None:
+        raise ValueError("append_final_state_to_h requires cu_seqlens.")
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    h = k.new_empty(B, NT + (N if append_final_state_to_h else 0), H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -339,7 +382,9 @@ def chunk_gated_delta_rule_fwd_h(
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
+        APPEND_FINAL_STATE=append_final_state_to_h,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        TOTAL_NT=NT,
     )
     return h, v_new

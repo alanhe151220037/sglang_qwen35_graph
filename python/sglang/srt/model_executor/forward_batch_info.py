@@ -306,6 +306,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # CPU mirrors produced by the scheduler. Eager Mamba metadata planning must
+    # not read the GPU tensors back just to inspect masks or build indices.
+    mamba_track_indices_cpu: Optional[List[int]] = None
+    mamba_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_seqlens_cpu: Optional[List[int]] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -456,6 +461,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_track_indices_cpu=(
+                list(batch.mamba_track_indices_cpu)
+                if batch.mamba_track_indices_cpu is not None
+                else None
+            ),
+            mamba_track_mask_cpu=(
+                list(batch.mamba_track_mask_cpu)
+                if batch.mamba_track_mask_cpu is not None
+                else None
+            ),
+            mamba_track_seqlens_cpu=(
+                list(batch.mamba_track_seqlens_cpu)
+                if batch.mamba_track_seqlens_cpu is not None
+                else None
+            ),
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -971,6 +991,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.mamba_track_seqlens is not None:
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
+            )
+        if self.mamba_track_indices_cpu is not None:
+            self.mamba_track_indices_cpu.extend(
+                [0] * (bs - len(self.mamba_track_indices_cpu))
+            )
+        if self.mamba_track_mask_cpu is not None:
+            self.mamba_track_mask_cpu.extend(
+                [False] * (bs - len(self.mamba_track_mask_cpu))
+            )
+        if self.mamba_track_seqlens_cpu is not None:
+            self.mamba_track_seqlens_cpu.extend(
+                [0] * (bs - len(self.mamba_track_seqlens_cpu))
             )
 
         if self.mrope_positions is not None:

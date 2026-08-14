@@ -389,6 +389,7 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    grid_max_seq_len: Optional[int] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -502,7 +503,9 @@ def causal_conv1d_fn(
         assert is_channel_last, "Need to run in channel-last layout"
 
     def grid(META):
-        max_seq_len = max(seq_lens_cpu)
+        max_seq_len = (
+            grid_max_seq_len if grid_max_seq_len is not None else max(seq_lens_cpu)
+        )
         return (
             len(seq_lens_cpu),  # batch_size
             (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],

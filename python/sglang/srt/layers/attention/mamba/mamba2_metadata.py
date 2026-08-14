@@ -36,10 +36,8 @@ class ForwardMetadata:
     retrieve_parent_token: Optional[torch.Tensor] = None
     # For prefill radix cache
     track_conv_indices: Optional[torch.Tensor] = None
-    track_ssm_h_src: Optional[torch.Tensor] = None
-    track_ssm_h_dst: Optional[torch.Tensor] = None
-    track_ssm_final_src: Optional[torch.Tensor] = None
-    track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_ssm_src: Optional[torch.Tensor] = None
+    track_ssm_dst: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
