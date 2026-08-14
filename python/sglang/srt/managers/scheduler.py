@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -252,6 +253,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+MAMBA_CACHE_REQUEST_DUMP_CACHED_TOKENS = 34112
+MAMBA_CACHE_REQUEST_DUMP_MIN_INPUT_TOKENS = 8192 * 3
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -363,6 +367,9 @@ class Scheduler(
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
         self.dp_rank = dp_rank
+        self.mamba_cache_filtered_request_dump_path = (
+            envs.SGLANG_MAMBA_CACHE_FILTERED_REQUEST_DUMP_PATH.get()
+        )
         self.tp_size = server_args.tp_size
         self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
@@ -414,6 +421,16 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
+        # Temporarily disable the filtered-request dump diagnostic.
+        # if (
+        #     self.mamba_cache_filtered_request_dump_path
+        #     and self.is_stats_logging_rank
+        #     and self.is_hybrid_ssm
+        # ):
+        #     logger.info(
+        #         "Filtered Mamba cache request dump enabled: path=%s",
+        #         os.path.abspath(self.mamba_cache_filtered_request_dump_path),
+        #     )
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -2444,6 +2461,57 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def _maybe_dump_mamba_cache_filtered_request(self, req: Req) -> None:
+        dump_path = self.mamba_cache_filtered_request_dump_path
+        if not dump_path or not self.is_stats_logging_rank or not self.is_hybrid_ssm:
+            return
+        dump_path = os.path.abspath(dump_path)
+
+        cached_tokens = len(req.prefix_indices)
+        input_tokens = len(req.origin_input_ids)
+        if (
+            cached_tokens != MAMBA_CACHE_REQUEST_DUMP_CACHED_TOKENS
+            or input_tokens <= MAMBA_CACHE_REQUEST_DUMP_MIN_INPUT_TOKENS
+        ):
+            return
+
+        record = {
+            "timestamp": time.time(),
+            "rid": req.rid,
+            "dp_rank": getattr(self, "dp_rank", None),
+            "input_tokens": input_tokens,
+            "cached_tokens": cached_tokens,
+            "mamba_track_anchor_pos": req.mamba_track_anchor_pos,
+            "input_text": req.origin_input_text,
+            "input_ids": req.origin_input_ids,
+        }
+        try:
+            parent = os.path.dirname(os.path.abspath(dump_path))
+            os.makedirs(parent, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            fd = os.open(
+                dump_path,
+                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                0o600,
+            )
+            with os.fdopen(fd, "a", encoding="utf-8") as fout:
+                fout.write(line + "\n")
+            logger.info(
+                "Dumped filtered Mamba cache request: rid=%s input_tokens=%s "
+                "cached_tokens=%s path=%s",
+                req.rid,
+                input_tokens,
+                cached_tokens,
+                dump_path,
+            )
+        except (OSError, TypeError, ValueError):
+            logger.warning(
+                "Failed to dump filtered Mamba cache request: rid=%s path=%s",
+                req.rid,
+                dump_path,
+                exc_info=True,
+            )
+
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
@@ -2681,6 +2749,13 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        prefill_max_requests = self.server_args.prefill_max_requests
+        # if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        #     # Keep the PD-prefill batch size fixed at one request per scheduler
+        #     # iteration. This also covers chunked-prefill continuation because it
+        #     # occupies the same can_run_list before admitting new requests.
+        #     prefill_max_requests = 1
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -2693,7 +2768,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -2754,6 +2829,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            # Temporarily disable the filtered-request dump diagnostic.
+            # if adder.can_run_list and req is adder.can_run_list[-1]:
+            #     self._maybe_dump_mamba_cache_filtered_request(req)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2787,6 +2865,14 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+        # if (
+        #     self.disaggregation_mode == DisaggregationMode.PREFILL
+        #     and len(can_run_list) != 1
+        # ):
+        #     logger.warning(
+        #         "PD-prefill scheduler must generate bs=1 batches, "
+        #         f"but got {len(can_run_list)} requests."
+        #     )
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]

@@ -28,6 +28,7 @@ import torch
 from numpy import float64
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -59,6 +60,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Temporarily disable intermediate Mamba milestones. Set this back to
+# ``8 * 1024`` to restore the 8K, 24K, 56K, ... retention thresholds.
+MAMBA_MILESTONE_BASE_TOKENS: Optional[int] = None
+
 
 class TreeNode:
 
@@ -72,6 +77,9 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
         self.mamba_host_value: Optional[torch.Tensor] = None
+        # An aligned Mamba checkpoint can represent a radix divergence even when
+        # its uncached branch suffix leaves this node with only one child.
+        self.is_mamba_branch_checkpoint = False
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -110,6 +118,10 @@ class TreeNode:
     @property
     def mamba_evicted(self):
         return self.mamba_value is None
+
+    @property
+    def is_mamba_branch(self):
+        return len(self.children) > 1 or self.is_mamba_branch_checkpoint
 
     @property
     def backuped(self):
@@ -239,6 +251,46 @@ class LRUList:
                 self._add_node_after(prev_node, node)
                 prev_node = node
             node = node.parent
+
+    def reset_node_and_parents_mru_by_mamba_priority(self, node, root_node):
+        """
+        Refresh matched Mamba states by structural eviction priority.
+
+        The MRU order is: branch nodes from root to leaf, then leaf nodes, then
+        intermediate milestone nodes. This preserves shared branch states first
+        while making non-branch checkpoints the first Mamba states to evict.
+        """
+        assert self.mamba, "Mamba priority refresh is only intended for mamba LRU"
+        nodes = []
+        while node != root_node:
+            if node.mamba_value is not None:
+                assert (
+                    node.id in self.cache
+                ), f"Resetting node {node.id=} not in mamba lru list when resetting root first"
+                nodes.append(node)
+            node = node.parent
+
+        # ``nodes`` is leaf-to-root. Build the desired MRU-to-LRU ordering.
+        branches = [node for node in reversed(nodes) if node.is_mamba_branch]
+        leaves = [
+            node
+            for node in nodes
+            if not node.is_mamba_branch and len(node.children) == 0
+        ]
+        milestones = [
+            node
+            for node in nodes
+            if not node.is_mamba_branch and len(node.children) == 1
+        ]
+        ordered_nodes = branches + leaves + milestones
+
+        # Detach every matched node before reinserting any of them. Using the
+        # public remove/insert pair keeps the linked-list pointers and cache
+        # dictionary in sync even when adjacent path nodes are reordered.
+        for node in ordered_nodes:
+            self.remove_node(node)
+        for node in reversed(ordered_nodes):
+            self.insert_mru(node)
 
     def insert_mru(self, node):
         """
@@ -386,16 +438,17 @@ class LRUList:
                     x_lru is not None and x_lru.id in self.cache
                 ), f"Incorrect LRU list, x_lru is None or not in cache: {x_lru=}, {x.id=}"
 
-                assert (
-                    x == x_lru
-                ), f"Incorrect LRU list, {self.mamba=}, x: {x.id=} != x_lru: {x_lru.id=}, {x.last_access_time=}, {x_lru.last_access_time=}"
+                if not self.mamba:
+                    assert (
+                        x == x_lru
+                    ), f"Incorrect LRU list, {self.mamba=}, x: {x.id=} != x_lru: {x_lru.id=}, {x.last_access_time=}, {x_lru.last_access_time=}"
                 assert (
                     x_lru.full_lock_ref == 0
                 ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.id=}"
                 assert (
                     x_lru.mamba_lock_ref == 0
                 ), f"x_lru should not be locked when idle, {x_lru.mamba_lock_ref=}, {x_lru.id=}"
-                x_lru = getattr(x, self.prv)
+                x_lru = getattr(x_lru, self.prv)
 
             if self.mamba:
                 evictable_size = tree_cache.mamba_evictable_size()
@@ -505,9 +558,29 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        prefix_len, mamba_exist = self._insert_helper(
+        insert_result = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
+        if len(insert_result) == 3:
+            prefix_len, mamba_exist, terminal_node = insert_result
+            if params.mamba_is_branch_checkpoint:
+                assert terminal_node != self.root_node, (
+                    "The root node cannot be a Mamba branch checkpoint"
+                )
+                terminal_node.is_mamba_branch_checkpoint = True
+            self._cleanup_non_retainable_mamba_states(terminal_node)
+            self.mamba_lru_list.reset_node_and_parents_mru_by_mamba_priority(
+                terminal_node, self.root_node
+            )
+        else:
+            prefix_len, mamba_exist = insert_result
+
+        if (
+            envs.SGLANG_LOG_MAMBA_RADIX_TREE.get()
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            logger.info("Mamba radix tree after insert:\n%s", self.tree_structure_str())
+
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
@@ -577,6 +650,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
+                    mamba_is_branch_checkpoint=self._is_mamba_branch_checkpoint_insert(
+                        req
+                    ),
                     prev_prefix_len=req.cache_protected_len,
                 )
             )
@@ -595,6 +671,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req,
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
+        elif not self.enable_mamba_extra_buffer:
+            # The newly inserted tree node now owns this slot. Leaving it on a
+            # completed request lets a later release_kv_cache() call return a
+            # live tree state to the Mamba pool.
+            req.mamba_pool_idx = None
 
         self.dec_lock_ref(req.last_node)
 
@@ -670,6 +751,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_forked,
+                mamba_is_branch_checkpoint=self._is_mamba_branch_checkpoint_insert(
+                    req
+                ),
                 prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
             )
@@ -719,6 +803,28 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._print_helper(self.root_node, 0)
         total_size, total_mamba_size = self._total_size_helper()
         print(f"#full_tokens: {total_size}, #mamba_num: {total_mamba_size}")
+
+    def tree_structure_str(self) -> str:
+        """Format radix nodes with path-local full-KV token ranges for debug logs."""
+        lines = []
+        stack = [(self.root_node, 0, 0)]
+        while stack:
+            node, depth, path_start = stack.pop()
+            path_end = path_start + (len(node.value) if node.value is not None else 0)
+            if node == self.root_node:
+                full_kv_range = "root"
+            else:
+                full_kv_range = f"[{path_start}, {path_end})"
+            lines.append(
+                f"{'  ' * depth}node={node.id} full_kv={full_kv_range} "
+                f"mamba_state={'yes' if node.mamba_value is not None else 'no'} "
+                f"mamba_branch_checkpoint="
+                f"{'yes' if node.is_mamba_branch_checkpoint else 'no'} "
+                f"children={len(node.children)}"
+            )
+            for child in reversed(list(node.children.values())):
+                stack.append((child, depth + 1, path_end))
+        return "\n".join(lines)
 
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
@@ -869,14 +975,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
 
-        if node.mamba_value is not None:
+        mamba_node = node
+        should_retry_mamba_cleanup = False
+        if mamba_node.mamba_value is not None:
             assert (
-                node.mamba_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"
-            if node.mamba_lock_ref == 1:
-                self.mamba_evictable_size_ += len(node.mamba_value)
-                self.mamba_protected_size_ -= len(node.mamba_value)
-            node.mamba_lock_ref -= 1
+                mamba_node.mamba_lock_ref > 0
+            ), f"dec_lock_ref on node with {mamba_node.mamba_lock_ref=}, {mamba_node.id=}"
+            if mamba_node.mamba_lock_ref == 1:
+                self.mamba_evictable_size_ += len(mamba_node.mamba_value)
+                self.mamba_protected_size_ -= len(mamba_node.mamba_value)
+            mamba_node.mamba_lock_ref -= 1
+            should_retry_mamba_cleanup = mamba_node.mamba_lock_ref == 0
 
         while node != self.root_node:
             assert (
@@ -888,6 +997,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.full_lock_ref -= 1
             node = node.parent
 
+        if should_retry_mamba_cleanup:
+            self._cleanup_non_retainable_mamba_state(mamba_node)
+
         return DecLockRefResult()
 
     def sanity_check(self):
@@ -895,6 +1007,29 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         self.full_lru_list.sanity_check(self)
         self.mamba_lru_list.sanity_check(self)
+
+        # # A tree-owned Mamba state must never return to the allocator's free
+        # # list. Check this only in the existing idle sanity path, not on the
+        # # prefix-match hot path.
+        # tree_mamba_indices = self.all_mamba_values_flatten()
+        # if tree_mamba_indices.numel() > 0:
+        #     unique_indices, counts = torch.unique(
+        #         tree_mamba_indices, return_counts=True
+        #     )
+        #     duplicate_indices = unique_indices[counts > 1]
+        #     assert duplicate_indices.numel() == 0, (
+        #         "Multiple tree nodes own the same Mamba state: "
+        #         f"{duplicate_indices=}"
+        #     )
+
+        #     free_slots = self.req_to_token_pool.mamba_pool.free_slots
+        #     overlapping = tree_mamba_indices[
+        #         torch.isin(tree_mamba_indices, free_slots)
+        #     ]
+        #     assert overlapping.numel() == 0, (
+        #         "Tree-owned Mamba state exists in pool free_slots: "
+        #         f"{overlapping=}"
+        #     )
 
     def evictable_size(self) -> Tuple[int, int]:
         # Note: use full_evictable_size() and mamba_evictable_size() instead.
@@ -1012,12 +1147,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Post-process the matched result."""
         cow_mamba = params.cow_mamba
         req = params.req
+        log_match = (
+            envs.SGLANG_LOG_MAMBA_RADIX_TREE.get()
+            and get_tensor_model_parallel_rank() == 0
+        )
+        full_match_len = None
+        if len(value) > best_value_len or log_match:
+            full_match_len = sum(len(v) for v in value)
 
-        # update time for matched nodes, and make nodes closer to root to be least recently used
-        # this allows mamba to evict nodes closer to root first
+        # update time for matched nodes. Full KV keeps leaf-side nodes newer, while
+        # Mamba keeps root-side nodes newer so leaf-side states are evicted first.
         node_update = last_node
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        self.mamba_lru_list.reset_node_and_parents_mru_by_mamba_priority(
+            node_update, self.root_node
+        )
 
         # This last_access_time is for sanity check, can be deleted after validation in production
         cur_time = get_last_access_time()
@@ -1032,8 +1176,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # does not have a mamba value.
         if len(value) > best_value_len:
             mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            assert full_match_len is not None
             mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
+                full_match_len // mamba_cache_chunk_size
             ) * mamba_cache_chunk_size
             mamba_branching_seqlen = (
                 mamba_cache_chunk_aligned_seqlen
@@ -1043,26 +1188,54 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
+        if log_match:
+            extra_key = params.key.extra_key
+            mamba_match_len = sum(len(v) for v in value[:best_value_len])
+            logger.info(
+                "Mamba radix prefix match: rid=%s requested=%s full_match=%s "
+                "mamba_match=%s mamba_node=%s branching=%s cow_mamba=%s "
+                "extra_key_hash=%s",
+                getattr(req, "rid", None),
+                len(params.key),
+                full_match_len,
+                mamba_match_len,
+                last_node.id,
+                mamba_branching_seqlen,
+                cow_mamba,
+                hash(extra_key) if extra_key is not None else None,
+            )
+
         # Copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
+                last_node_locked = False
+                # Try to allocate again while protecting the source state from
+                # eviction and deferred milestone cleanup.
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
-                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                    last_node_locked = True
+                try:
+                    if dst_index is None:
+                        self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                        dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                        assert dst_index is not None, "Can not alloc mamba cache"
+
+                    src_index = last_node.mamba_value
+                    assert src_index is not None, (
+                        "Matched Mamba state disappeared before COW copy: "
+                        f"{last_node.id=}"
+                    )
+                    self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                finally:
+                    if last_node_locked:
+                        self.dec_lock_ref(last_node)
                 req.mamba_pool_idx = dst_index[0]
             else:
                 src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-
         value = value[:best_value_len]
         if value:
             value = torch.cat(value)
@@ -1118,9 +1291,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
-    ) -> Tuple[int, bool]:
-        # Update the last access time from root to leaf, so that
-        # mamba will tombstone the node closer to root first
+    ) -> Tuple[int, bool, TreeNode]:
+        # Update the last access time from root to leaf. LRU order is maintained
+        # explicitly by the full and mamba lists.
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
@@ -1128,7 +1301,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
-            return 0, True
+            return 0, True, node
 
         child_key = key.child_key(self.page_size)
 
@@ -1181,7 +1354,99 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
-        return total_prefix_length, mamba_value_exist
+        return total_prefix_length, mamba_value_exist, node
+
+    @staticmethod
+    def _is_mamba_milestone(distance: int, previous_checkpoint: int = 0) -> bool:
+        """Whether ``distance`` reaches the next milestone after a checkpoint.
+
+        Milestones are currently disabled. When enabled, they are thresholds
+        ``8K, 24K, 56K, 120K, ...`` rather than exact sequence lengths. Once a
+        state has been retained after crossing one threshold, the next state is
+        not retained until it crosses the next threshold in the same segment.
+        """
+        milestone_base = MAMBA_MILESTONE_BASE_TOKENS
+        if milestone_base is None:
+            return False
+
+        next_milestone = milestone_base
+        while next_milestone <= previous_checkpoint:
+            next_milestone = next_milestone * 2 + milestone_base
+        return distance >= next_milestone
+
+    @staticmethod
+    def _is_mamba_branch_checkpoint_insert(req: Req) -> bool:
+        return (
+            req.mamba_branching_seqlen is not None
+            and req.mamba_last_track_seqlen == req.mamba_branching_seqlen
+        )
+
+    def _is_mamba_anchor(self, node: TreeNode) -> bool:
+        return node == self.root_node or node.is_mamba_branch
+
+    def _find_mamba_segment_anchor(self, node: TreeNode) -> TreeNode:
+        cur = node.parent
+        while cur is not None and not self._is_mamba_anchor(cur):
+            cur = cur.parent
+        return cur if cur is not None else self.root_node
+
+    def _mamba_segment_distance(self, anchor: TreeNode, node: TreeNode) -> int:
+        distance = 0
+        cur = node
+        while cur != anchor:
+            distance += len(cur.value)
+            cur = cur.parent
+            assert cur is not None, "anchor must be an ancestor of node"
+        return distance
+
+    def _last_mamba_checkpoint_distance(
+        self, anchor: TreeNode, node: TreeNode
+    ) -> int:
+        """Return the closest retained checkpoint before ``node`` in its segment."""
+        cur = node.parent
+        while cur is not None and cur != anchor:
+            if cur.mamba_value is not None:
+                return self._mamba_segment_distance(anchor, cur)
+            cur = cur.parent
+        return 0
+
+    def _can_retain_mamba_state(self, node: TreeNode) -> bool:
+        if node == self.root_node:
+            return False
+        if len(node.children) == 0:
+            return True
+        if node.is_mamba_branch:
+            return True
+        anchor = self._find_mamba_segment_anchor(node)
+        distance = self._mamba_segment_distance(anchor, node)
+        previous_checkpoint = self._last_mamba_checkpoint_distance(anchor, node)
+        return self._is_mamba_milestone(distance, previous_checkpoint)
+
+    def _drop_internal_mamba_state(self, node: TreeNode) -> bool:
+        if (
+            node == self.root_node
+            or node.mamba_value is None
+            or len(node.children) == 0
+            or node.mamba_lock_ref > 0
+        ):
+            return False
+
+        self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+        self.mamba_lru_list.remove_node(node)
+        self.mamba_evictable_size_ -= len(node.mamba_value)
+        node.mamba_value = None
+        return True
+
+    def _cleanup_non_retainable_mamba_state(self, node: TreeNode) -> None:
+        if node is None or node == self.root_node:
+            return
+        if node.mamba_value is not None and not self._can_retain_mamba_state(node):
+            self._drop_internal_mamba_state(node)
+
+    def _cleanup_non_retainable_mamba_states(self, terminal_node: TreeNode) -> None:
+        if terminal_node is None:
+            return
+        self._cleanup_non_retainable_mamba_state(terminal_node.parent)
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode

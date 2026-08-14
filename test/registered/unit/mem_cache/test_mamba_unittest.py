@@ -533,6 +533,85 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(tree.cache_controller.device_evictions, [])
         self.assertEqual(tree.cache_controller.host_evictions, [])
 
+    def test_aligned_mamba_branch_checkpoint_survives_unlock_cleanup(self):
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator()
+
+        leaf_req = make_dummy_req()
+        leaf_key = RadixKey([1, 2, 3, 4])
+        tree.insert(
+            InsertParams(
+                key=leaf_key,
+                value=allocator.alloc(len(leaf_key)),
+                mamba_value=leaf_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        checkpoint_req = make_dummy_req()
+        checkpoint_key = RadixKey([1, 2])
+        checkpoint_req.mamba_branching_seqlen = len(checkpoint_key)
+        checkpoint_req.mamba_last_track_seqlen = len(checkpoint_key)
+        tree.insert(
+            InsertParams(
+                key=checkpoint_key,
+                value=allocator.alloc(len(checkpoint_key)),
+                mamba_value=checkpoint_req.mamba_pool_idx.unsqueeze(0),
+                mamba_is_branch_checkpoint=tree._is_mamba_branch_checkpoint_insert(
+                    checkpoint_req
+                ),
+            )
+        )
+
+        match_result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 9]))
+        )
+        checkpoint = match_result.last_device_node
+        self.assertEqual(len(checkpoint.children), 1)
+        self.assertTrue(checkpoint.is_mamba_branch_checkpoint)
+        self.assertTrue(checkpoint.is_mamba_branch)
+        self.assertEqual(len(match_result.device_indices), len(checkpoint_key))
+
+        tree.inc_lock_ref(checkpoint)
+        tree.dec_lock_ref(checkpoint)
+
+        self.assertIsNotNone(checkpoint.mamba_value)
+        self.assertTrue(tree.mamba_lru_list.in_list(checkpoint))
+
+        leaf = next(iter(checkpoint.children.values()))
+        tree.match_prefix(MatchPrefixParams(key=leaf_key))
+        self.assertIs(tree.mamba_lru_list.get_lru_no_lock(), leaf)
+
+        ordinary_leaf_req = make_dummy_req()
+        ordinary_leaf_key = RadixKey([10, 11, 12, 13])
+        tree.insert(
+            InsertParams(
+                key=ordinary_leaf_key,
+                value=allocator.alloc(len(ordinary_leaf_key)),
+                mamba_value=ordinary_leaf_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        ordinary_parent_req = make_dummy_req()
+        ordinary_parent_key = RadixKey([10, 11])
+        tree.insert(
+            InsertParams(
+                key=ordinary_parent_key,
+                value=allocator.alloc(len(ordinary_parent_key)),
+                mamba_value=ordinary_parent_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        ordinary_parent = tree.match_prefix(
+            MatchPrefixParams(key=ordinary_parent_key)
+        ).last_device_node
+        self.assertEqual(len(ordinary_parent.children), 1)
+        self.assertFalse(ordinary_parent.is_mamba_branch_checkpoint)
+
+        tree.inc_lock_ref(ordinary_parent)
+        tree.dec_lock_ref(ordinary_parent)
+
+        self.assertIsNone(ordinary_parent.mamba_value)
+        self.assertFalse(tree.mamba_lru_list.in_list(ordinary_parent))
+        tree.sanity_check()
+
     def test_mamba_pool_cpu_offload(self):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""
         _, _, req_to_token_pool, _ = self._setup_tree_and_allocator()
