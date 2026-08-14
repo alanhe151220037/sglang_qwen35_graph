@@ -59,6 +59,15 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
+    def _needs_speculative_mamba_intermediate_states(self: ModelRunner) -> bool:
+        # A pure disaggregated prefill worker only runs target/draft EXTEND.
+        # TARGET_VERIFY, which consumes the intermediate rollback states, runs
+        # on the decode worker.
+        return (
+            self.server_args.disaggregation_mode != "prefill"
+            and not self.spec_algorithm.is_none()
+        )
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -81,7 +90,7 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         # reserve the memory for the intermediate mamba states used for spec dec
-        if not self.spec_algorithm.is_none():
+        if self._needs_speculative_mamba_intermediate_states():
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
@@ -238,6 +247,21 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        speculative_mamba_draft_tokens = (
+            self.server_args.speculative_num_draft_tokens
+            if self._needs_speculative_mamba_intermediate_states()
+            else None
+        )
+        if (
+            self.req_to_token_pool is None
+            and self.mambaish_config is not None
+            and self.server_args.disaggregation_mode == "prefill"
+            and self.server_args.speculative_num_draft_tokens is not None
+        ):
+            logger.info(
+                "Skipping speculative Mamba intermediate state buffers on "
+                "disaggregated prefill worker."
+            )
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -274,7 +298,7 @@ class ModelRunnerKVCacheMixin:
                                 if self.start_layer <= i < self.end_layer
                             ]
                         ),
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        speculative_num_draft_tokens=speculative_mamba_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -308,7 +332,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_num_draft_tokens=speculative_mamba_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )

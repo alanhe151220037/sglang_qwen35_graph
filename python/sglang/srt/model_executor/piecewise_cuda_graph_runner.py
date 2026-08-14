@@ -59,6 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_musa,
@@ -75,6 +76,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_musa = is_musa()
+
+
+def _is_single_layer_eagle_target(model_runner: ModelRunner) -> bool:
+    # NEXTN normalizes to EAGLE. is_eagle() is intentionally too broad here:
+    # it also includes EAGLE3 and FROZEN_KV_MTP, which need separate validation.
+    return (
+        not model_runner.is_draft_worker
+        and not model_runner.server_args.enable_multi_layer_eagle
+        and model_runner.spec_algorithm == SpeculativeAlgorithm.EAGLE
+    )
+
+
+def _get_capture_hidden_mode(model_runner: ModelRunner) -> CaptureHiddenMode:
+    if (
+        model_runner.server_args.enable_return_hidden_states
+        or _is_single_layer_eagle_target(model_runner)
+    ):
+        return CaptureHiddenMode.FULL
+    return CaptureHiddenMode.NULL
 
 
 @dataclass
@@ -165,7 +185,10 @@ class PiecewiseCudaGraphRunner:
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
+            and (
+                self.model_runner.spec_algorithm.is_none()
+                or _is_single_layer_eagle_target(self.model_runner)
+            )
         )
 
     def __init__(self, model_runner: ModelRunner):
@@ -224,11 +247,7 @@ class PiecewiseCudaGraphRunner:
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
         self.capture_forward_mode = ForwardMode.EXTEND
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
-
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.capture_hidden_mode = _get_capture_hidden_mode(model_runner)
 
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
@@ -425,7 +444,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -598,7 +617,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -771,6 +790,9 @@ class PiecewiseCudaGraphRunner:
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            mamba_track_indices_cpu=forward_batch.mamba_track_indices_cpu,
+            mamba_track_mask_cpu=forward_batch.mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,

@@ -43,6 +43,15 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
         self.assertEqual(server_args.load_balance_method, "follow_bootstrap_room")
 
+    def test_pd_prefill_disables_standard_cuda_graph_only(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disable_piecewise_cuda_graph=False,
+        )
+        self.assertTrue(server_args.disable_cuda_graph)
+        self.assertFalse(server_args.disable_piecewise_cuda_graph)
+
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")

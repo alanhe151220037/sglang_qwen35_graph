@@ -4145,11 +4145,16 @@ class ServerArgs:
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
 
-            if self.disable_piecewise_cuda_graph:
-                self.disable_cuda_graph = True
-                logger.warning(
-                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+            # A pure prefill worker never executes DECODE or TARGET_VERIFY.
+            # Disable the ordinary CUDA graph runner independently of PCG so
+            # NEXTN prefill can keep EXTEND piecewise graphs without allocating
+            # target-verify-only Mamba rollback buffers.
+            if not self.disable_cuda_graph:
+                logger.info(
+                    "Standard CUDA graph is disabled for prefill server; "
+                    "piecewise CUDA graph is controlled independently."
                 )
+            self.disable_cuda_graph = True
 
         if self.disaggregation_mode in ("prefill", "decode"):
             if (

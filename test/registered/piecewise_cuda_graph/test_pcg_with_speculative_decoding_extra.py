@@ -6,10 +6,23 @@ test_pcg_with_speculative_decoding.py.
 
 import unittest
 
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large")
+
+
+def _get_prefill_cuda_graph_passes(base_url: str) -> float:
+    response = requests.get(base_url + "/metrics")
+    response.raise_for_status()
+    return sum(
+        float(line.rsplit(" ", 1)[-1])
+        for line in response.text.splitlines()
+        if line.startswith("sglang:cuda_graph_passes_total{")
+        and 'mode="prefill_cuda_graph"' in line
+    )
 
 
 class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
@@ -24,7 +37,8 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
         "fp8",
         "--mamba-scheduler-strategy",
         "extra_buffer",
-        "--enable-piecewise-cuda-graph",
+        "--enable-metrics",
+        "--enforce-piecewise-cuda-graph",
         "--speculative-algorithm",
         "NEXTN",
         "--reasoning-parser",
@@ -34,6 +48,21 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
     max_tokens = 8192
     thinking_mode = "qwen3"
     accuracy_threshold = 0.75
+
+    def test_target_prefill_uses_pcg(self):
+        passes_before = _get_prefill_cuda_graph_passes(self.base_url)
+        response = requests.post(
+            self.base_url + "/v1/completions",
+            json={
+                "model": self.model,
+                "prompt": "NEXTN target prefill PCG validation sequence. " * 64,
+                "max_tokens": 4,
+                "temperature": 0,
+            },
+        )
+        response.raise_for_status()
+        passes_after = _get_prefill_cuda_graph_passes(self.base_url)
+        self.assertGreater(passes_after, passes_before)
 
 
 class TestPCGWithSTANDALONE(PCGSpecBase, unittest.TestCase):

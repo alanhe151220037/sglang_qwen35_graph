@@ -174,6 +174,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             batch.mamba_track_mask = None
             batch.mamba_track_seqlens = None
+            batch.mamba_track_indices_cpu = None
+            batch.mamba_track_mask_cpu = None
+            batch.mamba_track_seqlens_cpu = None
 
     def generate_attn_arg_prefill(
         self,
