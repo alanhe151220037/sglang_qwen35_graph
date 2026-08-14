@@ -85,6 +85,7 @@ from sglang.srt.utils import (
     maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
+    set_gpu_proc_affinity_from_config,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
@@ -822,7 +823,9 @@ def latency_test(
     initialize_fp4_gemm_config(server_args)
 
     # Set CPU affinity
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if server_args.cpu_affinity is not None:
+        set_gpu_proc_affinity_from_config(server_args.cpu_affinity, gpu_id)
+    elif get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, tp_rank
         )

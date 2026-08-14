@@ -2211,6 +2211,139 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
+def _expand_cpu_id_spec(cpu_id_spec: Union[List[int], str], context: str) -> List[int]:
+    if isinstance(cpu_id_spec, str):
+        cpu_ids = []
+        for part in cpu_id_spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_str, end_str = [item.strip() for item in part.split("-", 1)]
+                if not start_str.isdigit() or not end_str.isdigit():
+                    raise ValueError(
+                        f"Invalid CPU id range for {context}: {part}. "
+                        "Expected format like '0-15,32-47'."
+                    )
+                start, end = int(start_str), int(end_str)
+                if start > end:
+                    raise ValueError(
+                        f"Invalid CPU id range for {context}: {part}. "
+                        "Range start must be <= range end."
+                    )
+                cpu_ids.extend(range(start, end + 1))
+            else:
+                if not part.isdigit():
+                    raise ValueError(f"Invalid CPU id for {context}: {part}")
+                cpu_ids.append(int(part))
+    elif isinstance(cpu_id_spec, list):
+        cpu_ids = []
+        for cpu_id in cpu_id_spec:
+            if not isinstance(cpu_id, int) or isinstance(cpu_id, bool):
+                raise ValueError(
+                    f"Invalid CPU id for {context}: {cpu_id}. "
+                    "CPU ids must be integers."
+                )
+            cpu_ids.append(cpu_id)
+    else:
+        raise ValueError(
+            f"Invalid CPU affinity for {context}: expected a list of CPU ids "
+            "or a CPU range string."
+        )
+
+    cpu_ids = list(dict.fromkeys(cpu_ids))
+    if not cpu_ids:
+        raise ValueError(f"No valid CPU ids specified for {context}")
+    return cpu_ids
+
+
+def parse_cpu_affinity_config(cpu_affinity: str) -> Dict[int, List[int]]:
+    """
+    Parse per-GPU CPU affinity JSON config.
+
+    Supported formats:
+    - {"0": [0, 1, 2], "1": [3, 4, 5]}
+    - {"0": "0-31,64-95", "1": "32-63,96-127"}
+    - Path to a JSON file containing either of the above.
+    """
+    if cpu_affinity is None:
+        raise ValueError("CPU affinity config cannot be None.")
+
+    cpu_affinity = cpu_affinity.strip()
+    if not cpu_affinity:
+        raise ValueError("CPU affinity config cannot be empty.")
+
+    config_str = cpu_affinity
+    if cpu_affinity.endswith(".json"):
+        try:
+            with open(cpu_affinity, "r") as f:
+                config_str = f.read()
+        except (IOError, OSError) as e:
+            raise RuntimeError(
+                f"Failed to read CPU affinity JSON file {cpu_affinity}: {e}"
+            ) from e
+
+    try:
+        config = json.loads(config_str)
+    except JSONDecodeError as e:
+        raise ValueError("Failed to parse CPU affinity JSON config.") from e
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            "CPU affinity config must be a JSON object mapping GPU ids to CPU ids."
+        )
+
+    affinity_by_gpu: Dict[int, List[int]] = {}
+    for gpu_key, cpu_id_spec in config.items():
+        if isinstance(gpu_key, int):
+            gpu_id = gpu_key
+        elif isinstance(gpu_key, str) and gpu_key.isdigit():
+            gpu_id = int(gpu_key)
+        else:
+            raise ValueError(
+                "CPU affinity config keys must be GPU ids as integers or digit strings."
+            )
+
+        affinity_by_gpu[gpu_id] = _expand_cpu_id_spec(cpu_id_spec, f"GPU {gpu_id}")
+
+    if not affinity_by_gpu:
+        raise ValueError("CPU affinity config does not contain any GPU mappings.")
+
+    return affinity_by_gpu
+
+
+def set_gpu_proc_affinity_by_cpu_ids(gpu_id: int, bind_cpu_ids: List[int]):
+    pid = os.getpid()
+    p = psutil.Process(pid)
+
+    logical_cpu_count = psutil.cpu_count()
+    if logical_cpu_count is not None:
+        invalid_cpu_ids = [
+            cpu_id
+            for cpu_id in bind_cpu_ids
+            if cpu_id < 0 or cpu_id >= logical_cpu_count
+        ]
+        if invalid_cpu_ids:
+            raise ValueError(
+                f"Invalid CPU ids for GPU {gpu_id}: {invalid_cpu_ids}. "
+                f"Valid range is [0, {logical_cpu_count - 1}]."
+            )
+
+    p.cpu_affinity(bind_cpu_ids)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
+
+def set_gpu_proc_affinity_from_config(cpu_affinity: str, gpu_id: int):
+    affinity_by_gpu = parse_cpu_affinity_config(cpu_affinity)
+    if gpu_id not in affinity_by_gpu:
+        raise ValueError(
+            f"No CPU affinity configured for GPU {gpu_id}. "
+            f"Available GPU ids: {sorted(affinity_by_gpu.keys())}"
+        )
+
+    set_gpu_proc_affinity_by_cpu_ids(gpu_id, affinity_by_gpu[gpu_id])
+
+
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
     b_ = x.shape[0]
     n_ = x.shape[1]

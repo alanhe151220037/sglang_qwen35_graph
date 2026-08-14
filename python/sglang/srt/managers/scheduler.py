@@ -223,6 +223,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     require_mlp_sync,
+    set_gpu_proc_affinity_from_config,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -3971,11 +3972,13 @@ def configure_scheduler_process(
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
+    if server_args.cpu_affinity is not None:
+        set_gpu_proc_affinity_from_config(server_args.cpu_affinity, gpu_id)
+    elif envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    if not envs.SGLANG_NUMA_BIND_V2.get():
+    if server_args.cpu_affinity is None and not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
             numa_bind_to_node(numa_node)

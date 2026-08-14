@@ -1965,6 +1965,9 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            # The disaggregation fields below belong to SGLang's native generate
+            # request and are not accepted by the OpenAI chat-completions schema.
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,

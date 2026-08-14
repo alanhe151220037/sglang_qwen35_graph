@@ -765,6 +765,7 @@ class ServerArgs:
     enable_return_indexer_topk: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
+    cpu_affinity: Optional[str] = None
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
@@ -3323,7 +3324,7 @@ class ServerArgs:
 
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
-                    self.mooncake_ib_device
+                    self.mooncake_ib_device, allow_mapping=False
                 )
         if self.elastic_ep_rejoin:
             assert (
@@ -4123,7 +4124,7 @@ class ServerArgs:
             and self.disaggregation_mode in ("prefill", "decode")
         ) or self.encoder_transfer_backend == "mooncake":
             self.disaggregation_ib_device = self._validate_ib_devices(
-                self.disaggregation_ib_device
+                self.disaggregation_ib_device, allow_mapping=True
             )
 
         # Validate model type: only support Qwen models for now
@@ -4147,15 +4148,22 @@ class ServerArgs:
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
             )
 
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+    def _validate_ib_devices(
+        self, device_str: Optional[str], allow_mapping: bool = False
+    ) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1").
+                When allow_mapping is set, also accepts JSON mapping GPU ids to
+                comma-separated device names (e.g., {"0": "mlx5_0", "1": "mlx5_1"})
+                or a path to a JSON file containing that mapping.
+            allow_mapping: Whether to accept per-GPU JSON mapping.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            Normalized comma-separated string or normalized JSON mapping string of
+            validated device names, or None if input is None.
         """
         if device_str is None:
             logger.warning(
@@ -4163,22 +4171,10 @@ class ServerArgs:
             )
             return None
 
-        # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        if len(devices) == 0:
+        device_str = device_str.strip()
+        if not device_str:
             raise ValueError("No valid IB devices specified")
 
-        # Deduplicate while preserving order
-        unique_devices = list(dict.fromkeys(devices))
-        if len(unique_devices) != len(devices):
-            logger.warning(
-                "Duplicate IB devices specified: %s. Deduplicating to: %s",
-                device_str,
-                ",".join(unique_devices),
-            )
-            devices = unique_devices
-
-        # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
         if not os.path.isdir(ib_sysfs_path):
             raise RuntimeError(
@@ -4190,15 +4186,94 @@ class ServerArgs:
         if len(available_devices) == 0:
             raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
 
-        # Check for invalid devices
-        invalid_devices = [d for d in devices if d not in available_devices]
-        if len(invalid_devices) != 0:
-            raise ValueError(
-                f"Invalid IB devices specified: {invalid_devices}. "
-                f"Available devices: {sorted(available_devices)}"
+        def validate_device_list(devices_str: str, context: str) -> str:
+            devices = [d.strip() for d in devices_str.split(",") if d.strip()]
+            if len(devices) == 0:
+                raise ValueError(f"No valid IB devices specified for {context}")
+
+            unique_devices = list(dict.fromkeys(devices))
+            if len(unique_devices) != len(devices):
+                logger.warning(
+                    "Duplicate IB devices specified for %s: %s. Deduplicating to: %s",
+                    context,
+                    devices_str,
+                    ",".join(unique_devices),
+                )
+                devices = unique_devices
+
+            invalid_devices = [d for d in devices if d not in available_devices]
+            if len(invalid_devices) != 0:
+                raise ValueError(
+                    f"Invalid IB devices specified for {context}: {invalid_devices}. "
+                    f"Available devices: {sorted(available_devices)}"
+                )
+
+            return ",".join(devices)
+
+        def normalize_gpu_mapping(mapping: Dict[Any, Any]) -> str:
+            normalized_mapping: Dict[str, str] = {}
+            for gpu_key, ib_devices in mapping.items():
+                if isinstance(gpu_key, int):
+                    normalized_gpu_key = str(gpu_key)
+                elif isinstance(gpu_key, str) and gpu_key.isdigit():
+                    normalized_gpu_key = gpu_key
+                else:
+                    raise ValueError(
+                        "Invalid IB device mapping: keys must be GPU ids as "
+                        "integers or digit strings."
+                    )
+
+                if not isinstance(ib_devices, str):
+                    raise ValueError(
+                        "Invalid IB device mapping: values must be comma-separated "
+                        "IB device strings."
+                    )
+
+                normalized_mapping[normalized_gpu_key] = validate_device_list(
+                    ib_devices, f"GPU {normalized_gpu_key}"
+                )
+
+            if not normalized_mapping:
+                raise ValueError("No valid GPU mappings found in IB device mapping.")
+
+            return json.dumps(
+                dict(sorted(normalized_mapping.items(), key=lambda item: int(item[0]))),
+                separators=(",", ":"),
             )
 
-        return ",".join(devices)
+        if allow_mapping:
+            mapping_str = device_str
+            is_json_file = device_str.endswith(".json")
+            looks_like_json_mapping = device_str.startswith("{")
+            if is_json_file:
+                try:
+                    with open(device_str, "r") as f:
+                        mapping_str = f.read()
+                except (IOError, OSError) as e:
+                    raise RuntimeError(
+                        f"Failed to read IB device mapping file {device_str}: {e}"
+                    ) from e
+
+            try:
+                parsed_mapping = json.loads(mapping_str)
+            except json.JSONDecodeError as e:
+                if is_json_file:
+                    raise RuntimeError(
+                        f"Failed to parse IB device mapping file {device_str}"
+                    ) from e
+                if looks_like_json_mapping:
+                    raise ValueError(
+                        "Failed to parse IB device JSON mapping."
+                    ) from e
+            else:
+                if not isinstance(parsed_mapping, dict):
+                    raise ValueError(
+                        "IB device mapping must be a JSON object mapping GPU ids to "
+                        "comma-separated IB device strings."
+                    )
+                return normalize_gpu_mapping(parsed_mapping)
+
+        return validate_device_list(device_str, "all GPUs")
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
@@ -6753,6 +6828,15 @@ class ServerArgs:
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. If unset, will be automatically detected on NUMA systems.",
         )
         parser.add_argument(
+            "--cpu-affinity",
+            type=str,
+            default=ServerArgs.cpu_affinity,
+            help="Set per-GPU CPU affinity with a JSON object or a JSON file path. "
+            "Keys are GPU ids and values are CPU id lists or range strings, e.g. "
+            '\'{"0":[0,1,2,3],"1":"4-7,64-67"}\'. '
+            "This explicit mapping takes precedence over SGLANG_SET_CPU_AFFINITY and NUMA auto binding.",
+        )
+        parser.add_argument(
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
@@ -6891,7 +6975,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_ib_device,
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "or multiple comma-separated devices shared by all GPUs (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), "
+            "or per-GPU JSON mapping (e.g., --disaggregation-ib-device '{\"0\":\"mlx5_0\",\"1\":\"mlx5_1\"}') "
+            "or a path to a JSON mapping file. "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
